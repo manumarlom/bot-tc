@@ -153,7 +153,7 @@ async def get_paralelo():
     payload = {
         "asset": "USDT",
         "fiat":  "VES",
-        "tradeType": "SELL",
+        "tradeType": "BUY",
         "page": 1,
         "rows": 20,
         "publisherType": None
@@ -180,37 +180,49 @@ async def get_paralelo():
         return None
 
 async def get_bancos():
+    MES_ES = {
+    "enero":"january","febrero":"february","marzo":"march","abril":"april",
+    "mayo":"may","junio":"june","julio":"july","agosto":"august",
+    "septiembre":"september","octubre":"october","noviembre":"november","diciembre":"december"
+}
+
+async def get_bancos():
     """
-    Devuelve (fecha, compras, ventas)
-      fecha:  dd-mm-aaaa  (o '' si no se detecta)
-      compras/ventas: {banco: float}
+    Devuelve (fecha_str, compras, ventas) – si fecha no se reconoce se devuelve ''.
+    Nunca aborta si la fecha falla; siempre entrega las filas encontradas.
     """
     if (val := cache_get("bancos")):
         return val
 
     url = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
     try:
-        html = (await fetch("GET", url)).text
-        soup = BeautifulSoup(html, "html.parser")
+        html  = (await fetch("GET", url)).text
+        soup  = BeautifulSoup(html, "html.parser")
 
-        # fecha
+        # --- filas ---
+        compra, venta = {}, {}
+        for tr in soup.select("table tbody tr"):
+            cols = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
+            if len(cols) >= 3:
+                compra[cols[0]] = float(cols[1])
+                venta[cols[0]]  = float(cols[2])
+
+        # --- fecha (opcional) ---
         fecha = ""
         m = re.search(r"fecha\s+valor.*?(\d{2}\s+\w+\s+\d{4})", html, re.I)
         if m:
-            fecha = datetime.strptime(m.group(1), "%d %B %Y").strftime("%d-%m-%Y")
-
-        compra, venta = {}, {}
-        for tr in soup.select("table tbody tr"):
-            c = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
-            if len(c) >= 3:
-                banco = c[0]
-                compra[banco] = float(c[1])
-                venta[banco]  = float(c[2])
+            es = m.group(1).lower()
+            for k, v in MES_ES.items():
+                es = es.replace(k, v)         # traduce el mes a inglés
+            try:
+                fecha = datetime.strptime(es, "%d %B %Y").strftime("%d-%m-%Y")
+            except ValueError:
+                pass                          # deja fecha = ''
 
         if compra:
             cache_set("bancos", (fecha, compra, venta))
         return (fecha, compra, venta) if compra else None
+
     except Exception as e:
         print("Mesas:", e)
         return None
-
