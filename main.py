@@ -1,49 +1,65 @@
-import os, json, re, httpx, asyncio
+"""
+Bot Tipo de Cambio VE – Webhook WhatsApp Cloud
+Responde a:
+  oficial  → tasa BCV
+  p2p      → mejor vendedor USDT/VES en Binance P2P
+  bancos   → tasas informativas (mesas bancarias)
+"""
+
+import os, re, json, httpx, asyncio
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from bs4 import BeautifulSoup
 
-# ---------------- CONFIG ----------------
-VERIFY_TOKEN  = "miwhatsapitcambio"                 # el mismo que pegaste en Meta
-PHONE_ID      = os.getenv("PHONE_NUMBER_ID")        # ID numérico, no el +58…
-WHATS_TOKEN   = os.getenv("WHATS_TOKEN")            # token largo EAAG…
-TTL           = timedelta(minutes=15)               # caché de 15 min
+# ---------- Credenciales y config ----------
+VERIFY_TOKEN  = "miwhatsapitcambio"                   # igual al pegado en Meta
+PHONE_ID      = os.getenv("PHONE_NUMBER_ID")          # solo dígitos
+WHATS_TOKEN   = os.getenv("WHATS_TOKEN")              # token EAAG…
+TTL           = timedelta(minutes=15)                 # caché 15 min
 
 app    = FastAPI()
-_cache = {}                                         # key: (valor, expiración)
+_cache = {}                                           # key → (value, expiry)
 
-# ---------------- UTILIDAD DE CACHÉ ----------------
-def in_cache(key):      # devuelve True si la clave está y no expiró
-    return key in _cache and _cache[key][1] > datetime.utcnow()
+# ---------- Utilidades de caché ----------
+def cache_get(key):
+    if key in _cache and _cache[key][1] > datetime.utcnow():
+        return _cache[key][0]
+    return None
 
-def set_cache(key, val):
+def cache_set(key, val):
     _cache[key] = (val, datetime.utcnow() + TTL)
 
-# ---------------- WEBHOOK VERIFY ----------------
-@app.get("/webhook")
-# ---------- HELPERS HTTP ----------
-async def fetch_url(url, *, method="GET", **kwargs):
-    """
-    Envío HTTP con verify=False dentro del AsyncClient, NO en .request().
-    Acepta timeout, json, data, headers, etc. vía **kwargs.
-    """
+# ---------- Cliente HTTP (verify=False centralizado) ----------
+async def http_request(method: str, url: str, **kwargs):
+    """Pequeño wrapper que siempre usa verify=False para sortear SSL en Render Free."""
     timeout = kwargs.pop("timeout", 15)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
         return await client.request(method, url, **kwargs)
 
+# ---------- Webhook VERIFY (GET) ----------
+@app.get("/webhook")
+async def verify(req: Request):
+    qp = req.query_params
+    if qp.get("hub.mode") == "subscribe" and qp.get("hub.verify_token") == VERIFY_TOKEN:
+        return int(qp["hub.challenge"])
+    return {"status": "error"}
 
-# ---------------- WEBHOOK MENSAJES ----------------
+# ---------- Webhook MENSAJES (POST) ----------
 @app.post("/webhook")
 async def incoming(req: Request):
     data = await req.json()
+
+    # —— Filtra solo mensajes de texto; ignora 'statuses', etc. ——
     try:
         msg  = data["entry"][0]["changes"][0]["value"]["messages"][0]
+        if msg.get("type") != "text":
+            return {"status": "ignored"}
         text = msg["text"]["body"].strip().lower()
         waid = msg["from"]
-    except Exception as e:
-        print("Parse error:", e, json.dumps(data)[:300])
+    except (KeyError, IndexError):
         return {"status": "ignored"}
 
+    # —— Comandos ——
     if "oficial" in text:
         rate = await get_oficial()
         reply = f"📊 Oficial BCV: {rate:,.2f} Bs/USD" if rate else "BCV fuera de línea"
@@ -59,87 +75,76 @@ async def incoming(req: Request):
                  "• oficial – tasa BCV\n"
                  "• p2p     – mejor vendedor Binance\n"
                  "• bancos  – mesas bancarias")
+
     await send_whatsapp(waid, reply)
     return {"status": "sent"}
 
-# ---------------- ENVÍO WHATSAPP ----------------
+# ---------- Enviar mensaje WhatsApp ----------
 async def send_whatsapp(to, body):
     url = f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": False, "body": body}
-    }
+    payload = {"messaging_product": "whatsapp",
+               "to": to,
+               "type": "text",
+               "text": {"preview_url": False, "body": body}}
     headers = {"Authorization": f"Bearer {WHATS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.post(url, json=payload, headers=headers)
-        if r.status_code >= 300:
-            print("WA send error", r.status_code, r.text[:150])
+    r = await http_request("POST", url, json=payload, headers=headers)
+    if r.status_code >= 300:
+        print("WA send error", r.status_code, r.text[:160])
 
-# ---------------- HELPERS HTTP ----------------
-async def fetch_url(url, *, method="GET", **kwargs):
-    kwargs.setdefault("timeout", 15)
-    async with httpx.AsyncClient() as client:
-        r = (await client.request(method, url, **kwargs))
-    r.raise_for_status()
-    return r
-
-# ---------------- FETCHERS ----------------
+# ---------- Fetchers ----------
 async def get_oficial():
-    if in_cache("oficial"):
-        return _cache["oficial"][0]
-    url = "https://www.bcv.org.ve/"
+    if (rate := cache_get("oficial")) is not None:
+        return rate
     try:
-        html = (await fetch_url(url)).text
+        html = (await http_request("GET", "https://www.bcv.org.ve/")).text
         tag  = BeautifulSoup(html, "html.parser").find("p", string=re.compile("Dólar estadounidense"))
         rate = float(
             tag.find_next("strong").text.strip()
-                .replace(".", "")   # miles → nada
-                .replace(",", ".")  # decimal → .
+                .replace(".", "")    # miles sep
+                .replace(",", ".")   # decimal
         )
-        set_cache("oficial", rate)
+        cache_set("oficial", rate)
         return rate
     except Exception as e:
         print("BCV fetch error:", e)
         return None
 
 async def get_paralelo():
-    if in_cache("paralelo"):
-        return _cache["paralelo"][0]
-    url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+    if (rate := cache_get("paralelo")) is not None:
+        return rate
     payload = {
         "asset": "USDT",
         "fiat": "VES",
-        "tradeType": "SELL",      # vendedores (tú compras USDT pagando VES)
+        "tradeType": "SELL",      # vendedores → tú compras USDT
         "page": 1,
         "rows": 1,
         "publisherType": None
     }
     try:
-        r = await fetch_url(url, method="POST", json=payload)
-        price = float(r.json()["data"][0]["adv"]["price"])
-        set_cache("paralelo", price)
-        return price
+        r = await http_request("POST",
+                               "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+                               json=payload)
+        rate = float(r.json()["data"][0]["adv"]["price"])
+        cache_set("paralelo", rate)
+        return rate
     except Exception as e:
         print("Binance fetch error:", e)
         return None
 
 async def get_bancos():
-    if in_cache("bancos"):
-        return _cache["bancos"][0]
-    url = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
+    if (tabla := cache_get("bancos")) is not None:
+        return tabla
     try:
-        html = (await fetch_url(url)).text
+        html = (await http_request("GET",
+                                   "https://www.bcv.org.ve/tasas-informativas-sistema-bancario")).text
         soup = BeautifulSoup(html, "html.parser")
         tabla = {}
         for tr in soup.select("table tbody tr"):
             cols = [c.get_text(strip=True).replace(",", ".") for c in tr.find_all("td")]
             if len(cols) >= 3:
-                banco, valor = cols[0], float(cols[2])
-                tabla[banco] = valor
+                tabla[cols[0]] = float(cols[2])
         if tabla:
-            set_cache("bancos", tabla)
+            cache_set("bancos", tabla)
         return tabla or None
     except Exception as e:
         print("Mesas bancarias error:", e)
