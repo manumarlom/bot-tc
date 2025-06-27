@@ -80,20 +80,40 @@ async def send_whatsapp(to, body):
 # ─── FETCHERS ───
 async def get_oficial():
     """
-    Intenta, en orden, las tres fuentes propuestas.
-    Devuelve float (Bs/USD) o None.
+    Devuelve la tasa BCV Bs/USD, intentando tres fuentes en cascada.
+      1. Banco Exterior – columna VENTA
+      2. Monitor Dólar   – valor BCV en portada
+      3. FinanzasDigital – último post tasa BCV
+    Cachea 15 min.
     """
     if (v := cache_get("oficial")):
         return v
 
     SOURCES = [
-        # (url, patrón adicional para asegurar contexto)
-        ("https://www.bancoexterior.com/tasas-bcv/",       r"(venta|bcv)"),
-        ("https://monitordolarvenezuela.com/",             r"(bcv|dólar)"),
-        ("https://finanzasdigital.com/category/tasa-bcv/", r"(bcv|dólar)")
+        # (url, regex que fuerza «VENTA» antes del número)
+        ("https://www.bancoexterior.com/tasas-bcv/",
+         r"venta[^0-9]{0,30}(\d{1,3}(?:[.,]\d{2,})+)"),
+        ("https://monitordolarvenezuela.com/",
+         r"(bcv|d[óo]lar)[^0-9]{0,30}(\d{1,3}(?:[.,]\d{2,})+)"),
+        ("https://finanzasdigital.com/category/tasa-bcv/",
+         r"(bcv|d[óo]lar)[^0-9]{0,30}(\d{1,3}(?:[.,]\d{2,})+)")
     ]
 
-    num_pat = r"(\d{1,3}(?:[.,]\d{2,})+)"  # 106,86   106.86
+    for url, pattern in SOURCES:
+        try:
+            html = (await fetch("GET", url)).text.lower()
+            m = re.search(pattern, html, re.S)
+            if not m:
+                continue
+            num = m.group(1 if url.startswith("https://www.bancoexterior") else 2)
+            val = float(num.replace(".", "").replace(",", "."))
+            cache_set("oficial", val)
+            return val
+        except Exception as e:
+            print("Fuente BCV error:", url, e)
+
+    print("Todas las fuentes BCV fallaron")
+    return None
 
     for url, ctx_pat in SOURCES:
         try:
