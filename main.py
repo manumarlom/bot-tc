@@ -24,12 +24,13 @@ def set_cache(key, val):
 # ---------- HELPERS HTTP ----------
 async def fetch_url(url, *, method="GET", **kwargs):
     """
-    Envía GET/POST con verify=False para sortear certificados en Render Free.
-    Puedes pasar timeout, json, data, etc. vía **kwargs.
+    Envío HTTP con verify=False dentro del AsyncClient, NO en .request().
+    Acepta timeout, json, data, headers, etc. vía **kwargs.
     """
     timeout = kwargs.pop("timeout", 15)
     async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
         return await client.request(method, url, **kwargs)
+
 
 # ---------------- WEBHOOK MENSAJES ----------------
 @app.post("/webhook")
