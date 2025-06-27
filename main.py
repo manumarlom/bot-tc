@@ -97,54 +97,37 @@ async def send_whatsapp(to, body):
 
 # ---------- Fetchers ----------
 async def get_oficial():
-    """Devuelve el USD del cuadro derecho del home del BCV (dos decimales)."""
+    """
+    Devuelve el USD del cuadro derecho del home del BCV.
+    • Reconoce la fila donde el segundo <td> == 'USD'.
+    • Convierte a float y cachea.
+    """
     if (rate := get_cached("oficial")) is not None:
         return rate
+
     try:
         html = (await http_request("GET", "https://www.bcv.org.ve/")).text
         soup = BeautifulSoup(html, "html.parser")
 
-        # Encuentra fila cuyo primer <td> contenga 'USD'
-        fila = next(
-            (tr for tr in soup.select("table tbody tr")
-             if tr.find("td") and "usd" in tr.find("td").get_text(strip=True).lower()),
-            None
-        )
         valor_txt = None
-        if fila:
-            valor_txt = fila.find_all("td")[-1].get_text(strip=True)
-        else:
-            # Fallback: primera cifra con coma y 2+ decimales
-            m = re.search(r"(\d{1,3}[.,]\d{2,})", html)
-            if m:
-                valor_txt = m.group(1)
+        for tr in soup.select("table tbody tr"):
+            tds = tr.find_all("td")
+            if len(tds) >= 3 and tds[1].get_text(strip=True).upper() == "USD":
+                valor_txt = tds[2].get_text(strip=True)
+                break
 
         if valor_txt:
-            rate = float(valor_txt.replace(".", "").replace(",", "."))
+            # ejemplo '106,86200000'  ó  '106.862.00000'
+            valor_norm = valor_txt.replace(".", "").replace(",", ".")
+            rate       = float(valor_norm)
             set_cached("oficial", rate)
             return rate
 
-        print("BCV parse: USD no encontrado")
+        print("BCV parse: fila USD no encontrada")
         return None
 
     except Exception as e:
         print("BCV fetch error:", e)
-        return None
-
-async def get_paralelo():
-    if (rate := get_cached("paralelo")) is not None:
-        return rate
-    payload = {"asset": "USDT", "fiat": "VES", "tradeType": "SELL",
-               "page": 1, "rows": 1, "publisherType": None}
-    try:
-        r = await http_request("POST",
-                               "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-                               json=payload)
-        rate = float(r.json()["data"][0]["adv"]["price"])
-        set_cached("paralelo", rate)
-        return rate
-    except Exception as e:
-        print("Binance fetch error:", e)
         return None
 
 async def get_bancos():
