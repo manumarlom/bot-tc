@@ -72,14 +72,19 @@ async def incoming(r: Request):
         v = await get_paralelo()
         reply = f"🤝 Paralelo Binance: {fmt(v)} Bs/USDT" if v else "Binance fuera de línea"
 
-    elif "bancos" in text or "mesas" in text:
-        pares = await get_bancos()
-        if pares:
-            compra, venta = pares
-            reply = ("🟢 COMPRA\n" +
-                     "\n".join(f"{b}: {fmt(v)}" for b, v in compra.items()) +
-                     "\n\n🔴 VENTA\n" +
-                     "\n".join(f"{b}: {fmt(v)}" for b, v in venta.items()))
+   elif "bancos" in text or "mesas" in text:
+    res = await get_bancos()
+    if res:
+        fecha, compra, venta = res
+        cab = f"📅 {fecha}\n" if fecha else ""
+        reply = (cab +
+                 "🟢 COMPRA\n" +
+                 "\n".join(f"{b}: {fmt(v)}" for b, v in compra.items()) +
+                 "\n\n🔴 VENTA\n" +
+                 "\n".join(f"{b}: {fmt(v)}" for b, v in venta.items()))
+    else:
+        reply = "BCV aún no publica las mesas de hoy."
+
         else:
             reply = "BCV aún no publica las mesas de hoy."
 
@@ -180,15 +185,30 @@ async def get_paralelo():
 
 
 async def get_bancos():
+   async def get_bancos():
     """
-    Devuelve (compras, ventas)  dicts. Cache 15 min.
+    Devuelve (fecha, compras, ventas)
+      fecha   : str  '27-06-2025'  (o '' si no se encuentra)
+      compras : {banco: float}
+      ventas  : {banco: float}
+    Si hoy aún no está publicado, sigue mostrando la última fecha disponible.
+    Cache 15 min.
     """
-    if (pairs := cache_get("bancos")):
-        return pairs
+    if (data := cache_get("bancos")):
+        return data          # (fecha, compra, venta)
 
     url = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
     try:
-        soup = BeautifulSoup((await fetch("GET", url)).text, "html.parser")
+        html = (await fetch("GET", url)).text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # —— fecha (ej. 'Fecha Valor: Viernes, 27 Junio 2025') ——
+        fecha = ""
+        m = re.search(r"fecha\s+valor.*?(\d{2}\s+\w+\s+\d{4})", html, re.I)
+        if m:
+            # normaliza a 27-06-2025
+            fecha = datetime.strptime(m.group(1), "%d %B %Y").strftime("%d-%m-%Y")
+
         compra, venta = {}, {}
         for tr in soup.select("table tbody tr"):
             c = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
@@ -196,9 +216,11 @@ async def get_bancos():
                 banco = c[0]
                 compra[banco] = float(c[1])
                 venta[banco]  = float(c[2])
+
         if compra:
-            cache_set("bancos", (compra, venta))
-        return (compra, venta) if compra else None
+            cache_set("bancos", (fecha, compra, venta))
+        return (fecha, compra, venta) if compra else None
+
     except Exception as e:
         print("Mesas:", e)
         return None
