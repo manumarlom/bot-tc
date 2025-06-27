@@ -153,21 +153,26 @@ async def get_paralelo():
     if (v := cache_get("paralelo")):
         return v
 
-    # 1) ───── intento vía HTML “lo que ve el usuario” ─────
-    try:
-        html = (await fetch(
-            "GET",
-            "https://p2p.binance.com/es/trade/all-payments/USDT?fiat=VES",
-            headers={"User-Agent": "Mozilla/5.0"})).text
+   # 1) ─── HTML (lo que ve el usuario) ─────────────────────────────
+try:
+    html = (await fetch("GET",
+             "https://p2p.binance.com/es/trade/all-payments/USDT?fiat=VES",
+             headers={"User-Agent": "Mozilla/5.0"})).text
 
-        # busca el primer ‘Bs xxx,xxx’ – la página ya viene ordenada
-        m = re.search(r"Bs\s*([\d.]+,\d{2,})", html)
-        if m:
-            val = float(m.group(1).replace(".", "").replace(",", "."))
-            cache_set("paralelo", val, ttl=timedelta(minutes=3))
-            return val
-    except Exception as e:
-        print("HTML Binance:", e)
+    # captura **todos** los precios que aparecen en orden
+    prices = re.findall(r"Bs\s*([\d.]+,\d{2,})", html)
+    if len(prices) >= 2:
+        val = float(prices[1].replace(".", "").replace(",", "."))
+    elif prices:
+        val = float(prices[0].replace(".", "").replace(",", "."))
+    else:
+        val = None
+
+    if val:
+        cache_set("paralelo", val, ttl=timedelta(minutes=3))
+        return val
+except Exception as e:
+    print("HTML Binance:", e)
 
     # 2) ───── respaldo vía API (sin patrocinados) ─────
     try:
