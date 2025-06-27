@@ -95,38 +95,42 @@ async def send_whatsapp(to, body):
 # ────────────────────────── FETCHERS ───────────────────────────
 async def get_oficial():
     """
-    Extrae el USD (Bs/USD) del recuadro de la derecha en www.bcv.org.ve
-    Maneja variaciones de HTML:
-      • Busca fila donde aparezca 'USD' y luego toma la primera cifra con coma o punto
+    Obtiene el USD (Bs/USD) desde:
+    https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc
+    • Busca la fila donde la primera celda contenga 'Dólar' o 'USD'
+    • Devuelve float con dos decimales.
     """
     if (rate := get_cached("oficial")) is not None:
         return rate
+
+    URL = "https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc"
+
     try:
-        html = (await http_request("GET", "https://www.bcv.org.ve/")).text
+        html = (await http_request("GET", URL)).text
         soup = BeautifulSoup(html, "html.parser")
 
-        valor_txt = None
+        # — Localiza la tabla de referencia —
+        fila_usd = None
         for tr in soup.select("table tbody tr"):
-            texto_tr = tr.get_text(" ", strip=True).lower()
-            if "usd" in texto_tr:
-                # Busca primer número con , ó .
-                m = re.search(r"(\d{1,3}(?:[.,]\d{2,})+)", texto_tr)
-                if m:
-                    valor_txt = m.group(1)
-                    break
+            first_cell = tr.find("td")
+            if first_cell and re.search(r"(usd|dólar)", first_cell.get_text(strip=True).lower()):
+                fila_usd = tr
+                break
 
-        if valor_txt:
-            # Normaliza 106.86200000 ó 106,86200000
-            valor_norm = valor_txt.replace(".", "").replace(",", ".")
-            rate = float(valor_norm)
-            set_cached("oficial", rate)
-            return rate
+        if not fila_usd:
+            print("BCV parse: fila USD no encontrada")
+            return None
 
-        print("BCV parse: USD no encontrado")
-        return None
+        valor_txt = fila_usd.find_all("td")[-1].get_text(strip=True)
+        # Convierte 106,8620 → 106.8620 y a float
+        valor = float(valor_txt.replace(".", "").replace(",", "."))
+        set_cached("oficial", valor)
+        return valor
+
     except Exception as e:
         print("BCV fetch error:", e)
         return None
+
 
 async def get_paralelo():
     if (rate := get_cached("paralelo")) is not None:
