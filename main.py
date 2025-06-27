@@ -11,32 +11,30 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from bs4 import BeautifulSoup
 
-# ---------- Credenciales y config ----------
+# ---------- Configuración ----------
 VERIFY_TOKEN  = "miwhatsapitcambio"                   # igual al pegado en Meta
-PHONE_ID      = os.getenv("PHONE_NUMBER_ID")          # solo dígitos
+PHONE_ID      = os.getenv("PHONE_NUMBER_ID")          # ID numérico (no el +58…)
 WHATS_TOKEN   = os.getenv("WHATS_TOKEN")              # token EAAG…
 TTL           = timedelta(minutes=15)                 # caché 15 min
 
 app    = FastAPI()
-_cache = {}                                           # key → (value, expiry)
+_cache = {}                                           # key → (valor, expiración)
 
-# ---------- Utilidades de caché ----------
-def cache_get(key):
-    if key in _cache and _cache[key][1] > datetime.utcnow():
-        return _cache[key][0]
-    return None
+# ---------- Caché ----------
+def get_cached(key):
+    return _cache.get(key, (None, datetime.min))[0] \
+           if key in _cache and _cache[key][1] > datetime.utcnow() else None
 
-def cache_set(key, val):
+def set_cached(key, val):
     _cache[key] = (val, datetime.utcnow() + TTL)
 
 # ---------- Cliente HTTP (verify=False centralizado) ----------
 async def http_request(method: str, url: str, **kwargs):
-    """Pequeño wrapper que siempre usa verify=False para sortear SSL en Render Free."""
     timeout = kwargs.pop("timeout", 15)
     async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
         return await client.request(method, url, **kwargs)
 
-# ---------- Webhook VERIFY (GET) ----------
+# ---------- Webhook VERIFY ----------
 @app.get("/webhook")
 async def verify(req: Request):
     qp = req.query_params
@@ -44,12 +42,12 @@ async def verify(req: Request):
         return int(qp["hub.challenge"])
     return {"status": "error"}
 
-# ---------- Webhook MENSAJES (POST) ----------
+# ---------- Webhook MENSAJES ----------
 @app.post("/webhook")
 async def incoming(req: Request):
     data = await req.json()
 
-    # —— Filtra solo mensajes de texto; ignora 'statuses', etc. ——
+    # –– Filtrar mensajes de texto ––
     try:
         msg  = data["entry"][0]["changes"][0]["value"]["messages"][0]
         if msg.get("type") != "text":
@@ -59,7 +57,7 @@ async def incoming(req: Request):
     except (KeyError, IndexError):
         return {"status": "ignored"}
 
-    # —— Comandos ——
+    # –– Comandos ––
     if "oficial" in text:
         rate = await get_oficial()
         reply = f"📊 Oficial BCV: {rate:,.2f} Bs/USD" if rate else "BCV fuera de línea"
@@ -79,7 +77,7 @@ async def incoming(req: Request):
     await send_whatsapp(waid, reply)
     return {"status": "sent"}
 
-# ---------- Enviar mensaje WhatsApp ----------
+# ---------- Envío WhatsApp ----------
 async def send_whatsapp(to, body):
     url = f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
     payload = {"messaging_product": "whatsapp",
@@ -93,46 +91,52 @@ async def send_whatsapp(to, body):
 
 # ---------- Fetchers ----------
 async def get_oficial():
-    if (rate := cache_get("oficial")) is not None:
+    """Extrae el USD del cuadro a la derecha del home del BCV."""
+    if (rate := get_cached("oficial")) is not None:
         return rate
     try:
         html = (await http_request("GET", "https://www.bcv.org.ve/")).text
-        tag  = BeautifulSoup(html, "html.parser").find("p", string=re.compile("Dólar estadounidense"))
-        rate = float(
-            tag.find_next("strong").text.strip()
-                .replace(".", "")    # miles sep
-                .replace(",", ".")   # decimal
-        )
-        cache_set("oficial", rate)
-        return rate
+        soup = BeautifulSoup(html, "html.parser")
+
+        # El valor aparece en la tabla a la derecha: busca fila cuyo span contenga 'USD'
+        usd_row = next((tr for tr in soup.select("table tbody tr")
+                        if tr.find("td") and "usd" in tr.get_text(strip=True).lower()), None)
+        if usd_row:
+            valor_str = usd_row.find_all("td")[-1].get_text(strip=True)
+        else:
+            # Fallback: primera cifra con punto decimal (ej. 106,86200000)
+            m = re.search(r"(\d{1,3}[.,]\d{2,})", html)
+            valor_str = m.group(1) if m else None
+
+        if valor_str:
+            rate = float(valor_str.replace(".", "").replace(",", "."))
+            set_cached("oficial", rate)
+            return rate
+
+        print("BCV parse: no USD found")
+        return None
     except Exception as e:
         print("BCV fetch error:", e)
         return None
 
 async def get_paralelo():
-    if (rate := cache_get("paralelo")) is not None:
+    if (rate := get_cached("paralelo")) is not None:
         return rate
-    payload = {
-        "asset": "USDT",
-        "fiat": "VES",
-        "tradeType": "SELL",      # vendedores → tú compras USDT
-        "page": 1,
-        "rows": 1,
-        "publisherType": None
-    }
+    payload = {"asset": "USDT", "fiat": "VES", "tradeType": "SELL",
+               "page": 1, "rows": 1, "publisherType": None}
     try:
         r = await http_request("POST",
                                "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
                                json=payload)
         rate = float(r.json()["data"][0]["adv"]["price"])
-        cache_set("paralelo", rate)
+        set_cached("paralelo", rate)
         return rate
     except Exception as e:
         print("Binance fetch error:", e)
         return None
 
 async def get_bancos():
-    if (tabla := cache_get("bancos")) is not None:
+    if (tabla := get_cached("bancos")) is not None:
         return tabla
     try:
         html = (await http_request("GET",
@@ -144,7 +148,7 @@ async def get_bancos():
             if len(cols) >= 3:
                 tabla[cols[0]] = float(cols[2])
         if tabla:
-            cache_set("bancos", tabla)
+            set_cached("bancos", tabla)
         return tabla or None
     except Exception as e:
         print("Mesas bancarias error:", e)
