@@ -21,11 +21,15 @@ def set_cache(key, val):
 
 # ---------------- WEBHOOK VERIFY ----------------
 @app.get("/webhook")
-async def verify(req: Request):
-    q = req.query_params
-    if q.get("hub.mode") == "subscribe" and q.get("hub.verify_token") == VERIFY_TOKEN:
-        return int(q["hub.challenge"])
-    return {"status": "error"}
+# ---------- HELPERS HTTP ----------
+async def fetch_url(url, *, method="GET", **kwargs):
+    """
+    Envía GET/POST con verify=False para sortear certificados en Render Free.
+    Puedes pasar timeout, json, data, etc. vía **kwargs.
+    """
+    timeout = kwargs.pop("timeout", 15)
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+        return await client.request(method, url, **kwargs)
 
 # ---------------- WEBHOOK MENSAJES ----------------
 @app.post("/webhook")
