@@ -180,49 +180,52 @@ async def get_paralelo():
         return None
 
 async def get_bancos():
-    MES_ES = {
-    "enero":"january","febrero":"february","marzo":"march","abril":"april",
-    "mayo":"may","junio":"june","julio":"july","agosto":"august",
-    "septiembre":"september","octubre":"october","noviembre":"november","diciembre":"december"
-}
+ from datetime import date          # ya está importado arriba
 
 async def get_bancos():
     """
-    Devuelve (fecha_str, compras, ventas) – si fecha no se reconoce se devuelve ''.
-    Nunca aborta si la fecha falla; siempre entrega las filas encontradas.
+    Devuelve (fecha_mas_reciente:str, compras:dict, ventas:dict)
+    Siempre toma la fila MÁS RECIENTE de cada banco.
+    Cache 15 min.
     """
-    if (val := cache_get("bancos")):
-        return val
+    if (v := cache_get("bancos")):
+        return v
 
     url = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
     try:
-        html  = (await fetch("GET", url)).text
-        soup  = BeautifulSoup(html, "html.parser")
+        html = (await fetch("GET", url)).text
+        soup = BeautifulSoup(html, "html.parser")
 
-        # --- filas ---
-        compra, venta = {}, {}
+        # ----- leer todas las filas -----
+        rows = []
         for tr in soup.select("table tbody tr"):
-            cols = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
-            if len(cols) >= 3:
-                compra[cols[0]] = float(cols[1])
-                venta[cols[0]]  = float(cols[2])
+            tds = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
+            if len(tds) >= 4:                      # [fecha,banco,compra,venta]
+                try:
+                    f = datetime.strptime(tds[0], "%d-%m-%Y").date()
+                    rows.append((f, tds[1], float(tds[2]), float(tds[3])))
+                except ValueError:
+                    continue                       # ignora encabezados fantasma
 
-        # --- fecha (opcional) ---
-        fecha = ""
-        m = re.search(r"fecha\s+valor.*?(\d{2}\s+\w+\s+\d{4})", html, re.I)
-        if m:
-            es = m.group(1).lower()
-            for k, v in MES_ES.items():
-                es = es.replace(k, v)         # traduce el mes a inglés
-            try:
-                fecha = datetime.strptime(es, "%d %B %Y").strftime("%d-%m-%Y")
-            except ValueError:
-                pass                          # deja fecha = ''
+        if not rows:
+            return None
 
-        if compra:
-            cache_set("bancos", (fecha, compra, venta))
-        return (fecha, compra, venta) if compra else None
+        # ----- seleccionar la fila +reciente por banco -----
+        ultimo_por_banco = {}
+        for f, banco, comp, vent in rows:
+            if banco not in ultimo_por_banco or f > ultimo_por_banco[banco][0]:
+                ultimo_por_banco[banco] = (f, comp, vent)
+
+        # separa en dicts compra / venta y detecta la fecha global más nueva
+        fecha_max = max(v[0] for v in ultimo_por_banco.values())
+        compra = {b: v[1] for b, v in ultimo_por_banco.items()}
+        venta  = {b: v[2] for b, v in ultimo_por_banco.items()}
+
+        out = (fecha_max.strftime("%d-%m-%Y"), compra, venta)
+        cache_set("bancos", out, ttl=timedelta(minutes=15))
+        return out
 
     except Exception as e:
         print("Mesas:", e)
         return None
+
