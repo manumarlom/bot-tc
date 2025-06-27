@@ -1,168 +1,109 @@
-"""
-Bot Tipo de Cambio VE   –   Webhook WhatsApp Cloud
-Comandos:
-  oficial  → tasa BCV
-  p2p      → mejor vendedor USDT/VES en Binance P2P
-  bancos   → tasas informativas (mesas bancarias)
-"""
-
 import os, re, httpx
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from bs4 import BeautifulSoup
 
-# ──────────────────────────── CONFIG ────────────────────────────
-VERIFY_TOKEN  = "miwhatsapitcambio"                    # igual al de Meta
-PHONE_ID      = os.getenv("PHONE_NUMBER_ID")           # solo dígitos
-WHATS_TOKEN   = os.getenv("WHATS_TOKEN")               # token EAAG…
-TTL           = timedelta(minutes=15)                  # caché en memoria
+# ─────────── Config ───────────
+VERIFY_TOKEN  = "miwhatsapitcambio"
+PHONE_ID      = os.getenv("PHONE_NUMBER_ID")   # numérico
+WHATS_TOKEN   = os.getenv("WHATS_TOKEN")
+TTL           = timedelta(minutes=15)
 
-app    = FastAPI()
-_cache = {}                                            # key → (value, expiry)
+app, _cache = FastAPI(), {}
 
-# ──────────────────── UTILIDADES GENERALES ─────────────────────
-def get_cached(key):
-    val, exp = _cache.get(key, (None, datetime.min))
-    return val if exp > datetime.utcnow() else None
+# ─────────── Utils ───────────
+def cache_get(k):   # leer
+    v, t = _cache.get(k, (None, datetime.min))
+    return v if t > datetime.utcnow() else None
 
-def set_cached(key, val):
-    _cache[key] = (val, datetime.utcnow() + TTL)
+def cache_set(k, v):  # guardar
+    _cache[k] = (v, datetime.utcnow() + TTL)
 
-async def http_request(method: str, url: str, **kwargs):
-    timeout = kwargs.pop("timeout", 15)
-    async with httpx.AsyncClient(timeout=timeout, verify=False) as c:
-        return await c.request(method, url, **kwargs)
+async def fetch(m, u, **kw):
+    kw.setdefault("timeout", 15)
+    async with httpx.AsyncClient(verify=False, timeout=kw["timeout"]) as c:
+        return await c.request(m, u, **kw)
 
-def bs(num: float) -> str:
-    """Formatea 106.862000 → '106,86' (coma decimal, 2 decimales)."""
-    return f"{num:.2f}".replace(".", ",")
+fmt = lambda n: f"{n:.2f}".replace(".", ",")   # 106,86
 
-# ───────────────────────── WEBHOOK VERIFY ──────────────────────
+# ─────────── Verify ───────────
 @app.get("/webhook")
-async def verify(req: Request):
-    qp = req.query_params
-    if qp.get("hub.mode") == "subscribe" and qp.get("hub.verify_token") == VERIFY_TOKEN:
-        return int(qp["hub.challenge"])
-    return {"status": "error"}
+async def verify(r: Request):
+    q = r.query_params
+    if q.get("hub.mode")=="subscribe" and q.get("hub.verify_token")==VERIFY_TOKEN:
+        return int(q["hub.challenge"])
+    return {"status":"error"}
 
-# ───────────────────────── WEBHOOK POST ────────────────────────
+# ─────────── Webhook POST ───────────
 @app.post("/webhook")
-async def incoming(req: Request):
-    data = await req.json()
-
-    # Filtra mensajes de texto; ignora 'statuses'
+async def webhook(r: Request):
+    j = await r.json()
     try:
-        msg  = data["entry"][0]["changes"][0]["value"]["messages"][0]
-        if msg.get("type") != "text":
-            return {"status": "ignored"}
-        text = msg["text"]["body"].strip().lower()
-        waid = msg["from"]
-    except (KeyError, IndexError):
-        return {"status": "ignored"}
+        m = j["entry"][0]["changes"][0]["value"]["messages"][0]
+        if m.get("type")!="text": return {"status":"ignored"}
+        txt = m["text"]["body"].strip().lower(); waid = m["from"]
+    except (KeyError,IndexError):
+        return {"status":"ignored"}
 
-    # ----- Comandos -----
-    if "oficial" in text:
-        rate = await get_oficial()
-        reply = f"📊 Oficial BCV: {bs(rate)} Bs/USD" if rate else "BCV fuera de línea"
-    elif "p2p" in text or "paralelo" in text:
-        rate = await get_paralelo()
-        reply = f"🤝 Paralelo Binance: {bs(rate)} Bs/USDT" if rate else "Binance fuera de línea"
-    elif "bancos" in text or "mesas" in text:
-        tabla = await get_bancos()
-        reply = ("\n".join(f"{b}: {bs(v)}" for b, v in tabla.items())
-                 if tabla else "BCV aún no publica las tasas bancarias de hoy.")
+    if "oficial" in txt:
+        v = await get_oficial()
+        rep = f"📊 Oficial BCV: {fmt(v)} Bs/USD" if v else "BCV fuera de línea"
+    elif "p2p" in txt or "paralelo" in txt:
+        v = await get_paralelo()
+        rep = f"🤝 Paralelo Binance: {fmt(v)} Bs/USDT" if v else "Binance fuera de línea"
+    elif "bancos" in txt or "mesas" in txt:
+        t = await get_bancos()
+        rep = ("\n".join(f"{b}: {fmt(x)}" for b,x in t.items())
+               if t else "BCV aún no publica las mesas de hoy.")
     else:
-        reply = ("Comandos:\n"
-                 "• oficial – tasa BCV\n"
-                 "• p2p     – mejor vendedor Binance\n"
-                 "• bancos  – mesas bancarias")
+        rep=("Comandos:\n• oficial – BCV\n• p2p – Binance\n• bancos – mesas")
 
-    await send_whatsapp(waid, reply)
-    return {"status": "sent"}
+    await send(waid, rep); return {"status":"sent"}
 
-# ─────────────────────── ENVÍO WHATSAPP ────────────────────────
-async def send_whatsapp(to, body):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
-    payload = {"messaging_product": "whatsapp",
-               "to": to,
-               "type": "text",
-               "text": {"preview_url": False, "body": body}}
-    headers = {"Authorization": f"Bearer {WHATS_TOKEN}"}
-    r = await http_request("POST", url, json=payload, headers=headers)
-    if r.status_code >= 300:
-        print("WA send error", r.status_code, r.text[:150])
+async def send(to, body):
+    u=f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
+    p={"messaging_product":"whatsapp","to":to,"type":"text",
+       "text":{"preview_url":False,"body":body}}
+    h={"Authorization":f"Bearer {WHATS_TOKEN}"}
+    r=await fetch("POST",u,json=p,headers=h)
+    if r.status_code>=300: print("WA err",r.status_code,r.text[:120])
 
-# ────────────────────────── FETCHERS ───────────────────────────
+# ─────────── Fetchers ───────────
 async def get_oficial():
-    """
-    Obtiene el USD (Bs/USD) desde:
-    https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc
-    • Busca la fila donde la primera celda contenga 'Dólar' o 'USD'
-    • Devuelve float con dos decimales.
-    """
-    if (rate := get_cached("oficial")) is not None:
-        return rate
-
-    URL = "https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc"
-
+    if (v:=cache_get("oficial")): return v
+    URL="https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc"
     try:
-        html = (await http_request("GET", URL)).text
-        soup = BeautifulSoup(html, "html.parser")
+        html=(await fetch("GET",URL)).text.lower()
 
-        # — Localiza la tabla de referencia —
-        fila_usd = None
-        for tr in soup.select("table tbody tr"):
-            first_cell = tr.find("td")
-            if first_cell and re.search(r"(usd|dólar)", first_cell.get_text(strip=True).lower()):
-                fila_usd = tr
-                break
+        # Expresión: 'usd' o 'dólar' seguido de la primera cifra  nnn,nn  o  nnn.nn
+        m=re.search(r"(usd|d[óo]lar)[^0-9]*?(\d{1,3}(?:[.,]\d{2,})+)", html, re.S)
+        if not m:
+            print("BCV parse: no match"); return None
 
-        if not fila_usd:
-            print("BCV parse: fila USD no encontrada")
-            return None
-
-        valor_txt = fila_usd.find_all("td")[-1].get_text(strip=True)
-        # Convierte 106,8620 → 106.8620 y a float
-        valor = float(valor_txt.replace(".", "").replace(",", "."))
-        set_cached("oficial", valor)
-        return valor
-
+        num=m.group(2).replace(".", "").replace(",", ".")
+        v=float(num); cache_set("oficial",v); return v
     except Exception as e:
-        print("BCV fetch error:", e)
-        return None
-
+        print("BCV fetch:",e); return None
 
 async def get_paralelo():
-    if (rate := get_cached("paralelo")) is not None:
-        return rate
-    payload = {"asset": "USDT", "fiat": "VES", "tradeType": "SELL",
-               "page": 1, "rows": 1, "publisherType": None}
+    if (v:=cache_get("paralelo")): return v
+    pl={"asset":"USDT","fiat":"VES","tradeType":"SELL","page":1,"rows":1}
     try:
-        r = await http_request("POST",
-                               "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-                               json=payload)
-        rate = float(r.json()["data"][0]["adv"]["price"])
-        set_cached("paralelo", rate)
-        return rate
+        r=await fetch("POST","https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+                      json=pl)
+        v=float(r.json()["data"][0]["adv"]["price"]); cache_set("paralelo",v); return v
     except Exception as e:
-        print("Binance fetch error:", e)
-        return None
+        print("Binance:",e); return None
 
 async def get_bancos():
-    if (tabla := get_cached("bancos")) is not None:
-        return tabla
+    if (t:=cache_get("bancos")): return t
+    URL="https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
     try:
-        html = (await http_request("GET",
-                                   "https://www.bcv.org.ve/tasas-informativas-sistema-bancario")).text
-        soup = BeautifulSoup(html, "html.parser")
-        tabla = {}
+        soup=BeautifulSoup((await fetch("GET",URL)).text,"html.parser"); tabla={}
         for tr in soup.select("table tbody tr"):
-            cols = [c.get_text(strip=True).replace(",", ".") for c in tr.find_all("td")]
-            if len(cols) >= 3:
-                tabla[cols[0]] = float(cols[2])
-        if tabla:
-            set_cached("bancos", tabla)
+            c=[td.get_text(strip=True).replace(",",".") for td in tr.find_all("td")]
+            if len(c)>=3: tabla[c[0]]=float(c[2])
+        if tabla: cache_set("bancos",tabla)
         return tabla or None
     except Exception as e:
-        print("Mesas bancarias error:", e)
-        return None
+        print("Mesas:",e); return None
