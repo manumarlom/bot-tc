@@ -28,7 +28,7 @@ async def fetch_url(url, *, method="GET", **kwargs):
     Acepta timeout, json, data, headers, etc. vía **kwargs.
     """
     timeout = kwargs.pop("timeout", 15)
-    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         return await client.request(method, url, **kwargs)
 
 
@@ -80,7 +80,6 @@ async def send_whatsapp(to, body):
 # ---------------- HELPERS HTTP ----------------
 async def fetch_url(url, *, method="GET", **kwargs):
     kwargs.setdefault("timeout", 15)
-    kwargs.setdefault("verify", False)          # <- desactiva verificación TLS
     async with httpx.AsyncClient() as client:
         r = (await client.request(method, url, **kwargs))
     r.raise_for_status()
