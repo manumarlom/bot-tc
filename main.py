@@ -1,12 +1,12 @@
 """
-Bot Tipo de Cambio VE – Webhook WhatsApp Cloud
-Responde a:
+Bot Tipo de Cambio VE  –  Webhook WhatsApp Cloud
+Comandos:
   oficial  → tasa BCV
   p2p      → mejor vendedor USDT/VES en Binance P2P
   bancos   → tasas informativas (mesas bancarias)
 """
 
-import os, re, json, httpx, asyncio
+import os, re, json, httpx
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from bs4 import BeautifulSoup
@@ -15,24 +15,28 @@ from bs4 import BeautifulSoup
 VERIFY_TOKEN  = "miwhatsapitcambio"                   # igual al pegado en Meta
 PHONE_ID      = os.getenv("PHONE_NUMBER_ID")          # ID numérico (no el +58…)
 WHATS_TOKEN   = os.getenv("WHATS_TOKEN")              # token EAAG…
-TTL           = timedelta(minutes=15)                 # caché 15 min
+TTL           = timedelta(minutes=15)                 # caché en memoria
 
 app    = FastAPI()
-_cache = {}                                           # key → (valor, expiración)
+_cache = {}                                           # key → (value, expiry)
 
-# ---------- Caché ----------
+# ---------- Utilidades ----------
 def get_cached(key):
-    return _cache.get(key, (None, datetime.min))[0] \
-           if key in _cache and _cache[key][1] > datetime.utcnow() else None
+    val, exp = _cache.get(key, (None, datetime.min))
+    return val if exp > datetime.utcnow() else None
 
 def set_cached(key, val):
     _cache[key] = (val, datetime.utcnow() + TTL)
 
-# ---------- Cliente HTTP (verify=False centralizado) ----------
 async def http_request(method: str, url: str, **kwargs):
+    """Wrapper HTTP con verify=False (Render Free no trae CA completos)."""
     timeout = kwargs.pop("timeout", 15)
-    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-        return await client.request(method, url, **kwargs)
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as c:
+        return await c.request(method, url, **kwargs)
+
+def formatea_bs(num: float) -> str:
+    """‘106,86’ – coma decimal y dos decimales, sin miles."""
+    return f"{num:.2f}".replace(".", ",")
 
 # ---------- Webhook VERIFY ----------
 @app.get("/webhook")
@@ -47,7 +51,7 @@ async def verify(req: Request):
 async def incoming(req: Request):
     data = await req.json()
 
-    # –– Filtrar mensajes de texto ––
+    # Filtra solo mensajes de texto
     try:
         msg  = data["entry"][0]["changes"][0]["value"]["messages"][0]
         if msg.get("type") != "text":
@@ -57,16 +61,18 @@ async def incoming(req: Request):
     except (KeyError, IndexError):
         return {"status": "ignored"}
 
-    # –– Comandos ––
+    # Comandos
     if "oficial" in text:
         rate = await get_oficial()
-        reply = f"📊 Oficial BCV: {rate:,.2f} Bs/USD" if rate else "BCV fuera de línea"
+        reply = (f"📊 Oficial BCV: {formatea_bs(rate)} Bs/USD"
+                 if rate else "BCV fuera de línea")
     elif "p2p" in text or "paralelo" in text:
         rate = await get_paralelo()
-        reply = f"🤝 Paralelo Binance: {rate:,.2f} Bs/USDT" if rate else "Binance fuera de línea"
+        reply = (f"🤝 Paralelo Binance: {formatea_bs(rate)} Bs/USDT"
+                 if rate else "Binance fuera de línea")
     elif "bancos" in text or "mesas" in text:
         tabla = await get_bancos()
-        reply = ("\n".join(f"{b}: {v:,.2f}" for b, v in tabla.items())
+        reply = ("\n".join(f"{b}: {formatea_bs(v)}" for b, v in tabla.items())
                  if tabla else "BCV aún no publica las tasas bancarias de hoy.")
     else:
         reply = ("Comandos:\n"
@@ -87,34 +93,40 @@ async def send_whatsapp(to, body):
     headers = {"Authorization": f"Bearer {WHATS_TOKEN}"}
     r = await http_request("POST", url, json=payload, headers=headers)
     if r.status_code >= 300:
-        print("WA send error", r.status_code, r.text[:160])
+        print("WA send error", r.status_code, r.text[:150])
 
 # ---------- Fetchers ----------
 async def get_oficial():
-    """Extrae el USD del cuadro a la derecha del home del BCV."""
+    """Devuelve el USD del cuadro derecho del home del BCV (dos decimales)."""
     if (rate := get_cached("oficial")) is not None:
         return rate
     try:
         html = (await http_request("GET", "https://www.bcv.org.ve/")).text
         soup = BeautifulSoup(html, "html.parser")
 
-        # El valor aparece en la tabla a la derecha: busca fila cuyo span contenga 'USD'
-        usd_row = next((tr for tr in soup.select("table tbody tr")
-                        if tr.find("td") and "usd" in tr.get_text(strip=True).lower()), None)
-        if usd_row:
-            valor_str = usd_row.find_all("td")[-1].get_text(strip=True)
+        # Encuentra fila cuyo primer <td> contenga 'USD'
+        fila = next(
+            (tr for tr in soup.select("table tbody tr")
+             if tr.find("td") and "usd" in tr.find("td").get_text(strip=True).lower()),
+            None
+        )
+        valor_txt = None
+        if fila:
+            valor_txt = fila.find_all("td")[-1].get_text(strip=True)
         else:
-            # Fallback: primera cifra con punto decimal (ej. 106,86200000)
+            # Fallback: primera cifra con coma y 2+ decimales
             m = re.search(r"(\d{1,3}[.,]\d{2,})", html)
-            valor_str = m.group(1) if m else None
+            if m:
+                valor_txt = m.group(1)
 
-        if valor_str:
-            rate = float(valor_str.replace(".", "").replace(",", "."))
+        if valor_txt:
+            rate = float(valor_txt.replace(".", "").replace(",", "."))
             set_cached("oficial", rate)
             return rate
 
-        print("BCV parse: no USD found")
+        print("BCV parse: USD no encontrado")
         return None
+
     except Exception as e:
         print("BCV fetch error:", e)
         return None
