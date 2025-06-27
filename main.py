@@ -2,6 +2,8 @@ import os, re, httpx
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from bs4 import BeautifulSoup
+from collections import deque
+PROCESADOS = deque(maxlen=100)
 
 # ─── Config ───
 VERIFY_TOKEN  = "miwhatsapitcambio"          # el mismo que pegaste en Meta
@@ -16,8 +18,8 @@ def cache_get(k):
     v, exp = _cache.get(k, (None, datetime.min))
     return v if exp > datetime.utcnow() else None
 
-def cache_set(k, v):
-    _cache[k] = (v, datetime.utcnow() + TTL)
+def cache_set(k, v, ttl: timedelta = TTL):
+    _cache[k] = (v, datetime.utcnow() + ttl)
 
 async def fetch(m, u, **kw):
     kw.setdefault("timeout", 15)
@@ -53,10 +55,14 @@ async def incoming(r: Request):
     elif "p2p" in txt or "paralelo" in txt:
         v = await get_paralelo()
         rep = f"🤝 Paralelo Binance: {fmt(v)} Bs/USDT" if v else "Binance fuera de línea"
-    elif "bancos" in txt or "mesas" in txt:
-        t = await get_bancos()
-        rep = ("\n".join(f"{b}: {fmt(x)}" for b, x in t.items())
-               if t else "BCV aún no publica las mesas de hoy.")
+   elif "bancos" in txt or "mesas" in txt:
+    pares = await get_bancos()
+    if pares:
+        compra, venta = pares
+        rep  = "🟢 COMPRA\n" + "\n".join(f"{b}: {fmt(v)}" for b, v in compra.items())
+        rep += "\n\n🔴 VENTA\n" + "\n".join(f"{b}: {fmt(v)}" for b, v in venta.items())
+    else:
+        rep = "BCV aún no publica las mesas de hoy."
     else:
         rep = ("Comandos:\n"
                "• oficial – tasa BCV\n"
@@ -134,36 +140,76 @@ async def get_oficial():
     return None
 
 async def get_paralelo():
+    async def get_paralelo():
+    """
+    Devuelve el mejor precio de venta USDT/VES en Binance P2P (no promocionados).
+    Cachea solo 10 minutos.
+    """
     if (v := cache_get("paralelo")):
         return v
-    pl = {"asset": "USDT", "fiat": "VES", "tradeType": "SELL",
-          "page": 1, "rows": 1, "publisherType": None}
+
+    url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+    payload = {
+        "asset": "USDT",
+        "fiat": "VES",
+        "tradeType": "SELL",   # tú compras VES, el anunciante vende USDT
+        "page": 1,
+        "rows": 20,
+        "publisherType": None  # incluye merchants y usuarios
+    }
+
     try:
-        r = await fetch("POST",
-                        "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-                        json=pl)
-        v = float(r.json()["data"][0]["adv"]["price"])
-        cache_set("paralelo", v)
-        return v
-    except Exception as e:
-        print("Binance:", e)
+        r = await fetch("POST", url, json=payload)
+        ads = r.json()["data"]
+
+        precios = [
+            float(ad["adv"]["price"])
+            for ad in ads
+            if not ad["adv"].get("proMerchantAds")      # no promocionados
+               and float(ad["adv"]["surplusAmount"]) > 0 # con saldo
+        ]
+
+        if precios:
+            best = min(precios)
+            cache_set("paralelo", best, ttl=timedelta(minutes=3))
+            return best
+
+        print("Binance: sin anuncios válidos")
         return None
 
+    except Exception as e:
+        print("Binance fetch error:", e)
+        return None
+
+
 async def get_bancos():
-    if (t := cache_get("bancos")):
-        return t
+   async def get_bancos():
+    """
+    Devuelve (compras, ventas)
+      compras = {banco: float}
+      ventas  = {banco: float}
+    Cachea 15 min.
+    """
+    if (val := cache_get("bancos")):
+        return val          # (compra, venta)
+
     URL = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
     try:
-        soup = BeautifulSoup((await fetch("GET", URL)).text, "html.parser")
-        tabla = {}
+        html  = (await fetch("GET", URL)).text
+        soup  = BeautifulSoup(html, "html.parser")
+        compra, venta = {}, {}
+
         for tr in soup.select("table tbody tr"):
-            c = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
-            if len(c) >= 3:
-                tabla[c[0]] = float(c[2])
-        if tabla:
-            cache_set("bancos", tabla)
-        return tabla or None
+            celdas = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
+            if len(celdas) >= 3:
+                banco  = celdas[0]
+                compra[banco] = float(celdas[1])
+                venta[banco]  = float(celdas[2])
+
+        if compra:
+            cache_set("bancos", (compra, venta))
+        return (compra, venta) if compra else None
+
     except Exception as e:
         print("Mesas:", e)
         return None
-
