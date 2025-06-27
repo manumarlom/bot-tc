@@ -144,40 +144,59 @@ async def get_oficial():
 
 async def get_paralelo():
     """
-    Mejor precio USDT/VES (no promocionados, saldo>0) cache 3 min.
+    Devuelve el primer precio que muestra
+    https://p2p.binance.com/es/trade/all-payments/USDT?fiat=VES
+    (tú compras USDT - anuncio SELL).  Si la página cambia o
+    Cloudflare bloquea, usa la API como respaldo.
+    Cache 3 min.
     """
     if (v := cache_get("paralelo")):
         return v
 
-    url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-    payload = {
-        "asset": "USDT",
-        "fiat":  "VES",
-        "tradeType": "BUY",
-        "page": 1,
-        "rows": 20,
-        "publisherType": None
-    }
-
+    # 1) ───── intento vía HTML “lo que ve el usuario” ─────
     try:
-        r   = await fetch("POST", url, json=payload)
-        ads = r.json()["data"]
+        html = (await fetch(
+            "GET",
+            "https://p2p.binance.com/es/trade/all-payments/USDT?fiat=VES",
+            headers={"User-Agent": "Mozilla/5.0"})).text
+
+        # busca el primer ‘Bs xxx,xxx’ – la página ya viene ordenada
+        m = re.search(r"Bs\s*([\d.]+,\d{2,})", html)
+        if m:
+            val = float(m.group(1).replace(".", "").replace(",", "."))
+            cache_set("paralelo", val, ttl=timedelta(minutes=3))
+            return val
+    except Exception as e:
+        print("HTML Binance:", e)
+
+    # 2) ───── respaldo vía API (sin patrocinados) ─────
+    try:
+        url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+        payload = {
+            "asset": "USDT",
+            "fiat":  "VES",
+            "tradeType": "SELL",
+            "page": 1,
+            "rows": 20,
+            "publisherType": None
+        }
+        ads = (await fetch("POST", url, json=payload)).json()["data"]
 
         precios = [
             float(ad["adv"]["price"])
             for ad in ads
-            if not ad["adv"].get("proMerchantAds") and float(ad["adv"]["surplusAmount"]) > 0
+            if not ad["adv"].get("proMerchantAds")
+            and float(ad["adv"]["surplusAmount"]) > 0
         ]
         if precios:
             best = min(precios)
             cache_set("paralelo", best, ttl=timedelta(minutes=3))
             return best
-
-        print("Binance: sin anuncios válidos")
-        return None
     except Exception as e:
-        print("Binance fetch error:", e)
-        return None
+        print("API Binance:", e)
+
+    return None          # si todo falló
+
 
 async def get_bancos():
  from datetime import date          # ya está importado arriba
