@@ -1,172 +1,293 @@
-# ──────────────────────────────────────────────────────────────
-# main.py  – WhatsApp FX-Bot (BCV, Binance P2P, Mesas Bancarias)
-# Requisitos:
-#   pip install fastapi "uvicorn[standard]" httpx bs4 python-dotenv
-#   Establecer variables de entorno:
-#     WHATS_TOKEN       →  token permanente o temporal
-#     PHONE_NUMBER_ID   →  id numérico del WABA
-# ──────────────────────────────────────────────────────────────
-import os, re, json, asyncio, httpx
-from typing import List, Tuple
-from fastapi import FastAPI, Request, HTTPException
+# main.py  –  Bot Tipo de Cambio VE  (WhatsApp Cloud)
+
+
+import os
+import re
+import httpx
+from datetime import datetime, timedelta
+from collections import deque
+from fastapi import FastAPI, Request
 from bs4 import BeautifulSoup
-from datetime import datetime
 
-TOKEN          = os.getenv("WHATS_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-app = FastAPI()
+# ───────────── Configuración ─────────────
+VERIFY_TOKEN   = "miwhatsapitcambio"
+PHONE_ID       = os.getenv("PHONE_NUMBER_ID")   # solo dígitos
+WHATS_TOKEN    = os.getenv("WHATS_TOKEN")       # EAAG…
+TTL_DEFAULT    = timedelta(minutes=15)
 
-# ──────────────────────────────────────────────────────────────
-# Helpers HTTP
-# ──────────────────────────────────────────────────────────────
-async def fetch(method: str, url: str, **kwargs) -> httpx.Response:
-    """Pequeño wrapper con timeout y follow_redirects."""
-    async with httpx.AsyncClient(
-        timeout=15,
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (FX-Bot)"}
-    ) as client:
-        r = await client.request(method, url, **kwargs)
-        r.raise_for_status()
-        return r
 
-async def send_text(text: str, to: str) -> None:
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+app           = FastAPI()
+_cache        = {}                 # key → (valor, expiración)
+PROCESADOS    = deque(maxlen=100)  # ids ya atendidos
+
+
+fmt = lambda n: f"{n:.2f}".replace(".", ",")    # 106,86
+
+
+# ───────────── Cache helpers ─────────────
+def cache_get(k):
+    val, exp = _cache.get(k, (None, datetime.min))
+    return val if exp > datetime.utcnow() else None
+
+
+def cache_set(k, v, ttl: timedelta = TTL_DEFAULT):
+    _cache[k] = (v, datetime.utcnow() + ttl)
+
+
+# ───────────── HTTP helper (verify=False) ─────────────
+async def fetch(method, url, **kw):
+    kw.setdefault("timeout", 15)
+    async with httpx.AsyncClient(verify=False, timeout=kw["timeout"]) as c:
+        return await c.request(method, url, **kw)
+
+
+# ───────────── Webhook VERIFY ─────────────
+@app.get("/webhook")
+async def verify(r: Request):
+    q = r.query_params
+    if q.get("hub.mode") == "subscribe" and q.get("hub.verify_token") == VERIFY_TOKEN:
+        return int(q["hub.challenge"])
+    return {"status": "error"}
+
+
+# ───────────── Webhook POST ─────────────
+@app.post("/webhook")
+async def incoming(r: Request):
+    data = await r.json()
+    try:
+        msg  = data["entry"][0]["changes"][0]["value"]["messages"][0]
+        if msg.get("type") != "text":
+            return {"status": "ignored"}
+        msg_id = msg["id"]
+        if msg_id in PROCESADOS:
+            return {"status": "duplicate"}
+        PROCESADOS.append(msg_id)
+
+
+        text = msg["text"]["body"].strip().lower()
+        waid = msg["from"]
+    except (KeyError, IndexError):
+        return {"status": "ignored"}
+
+
+    # ── Comandos ───────────────────────────
+    if "oficial" in text:
+        v = await get_oficial()
+        reply = f"📊 Oficial BCV: {fmt(v)} Bs/USD" if v else "BCV fuera de línea"
+
+
+    elif "paralelo" in text or "p2p" in text:
+        v = await get_paralelo()
+        reply = f"🤝 Paralelo Binance: {fmt(v)} Bs/USDT" if v else "Binance fuera de línea"
+
+
+    elif "bancos" in text or "mesas" in text:
+        res = await get_bancos()
+        if res:
+            fecha, compra, venta = res
+            cab = f"📅 {fecha}\n" if fecha else ""
+            reply = (cab +
+                     "🟢 COMPRA\n" +
+                     "\n".join(f"{b}: {fmt(x)}" for b, x in compra.items()) +
+                     "\n\n🔴 VENTA\n" +
+                     "\n".join(f"{b}: {fmt(x)}" for b, x in venta.items()))
+        else:
+            reply = "BCV aún no publica las mesas de hoy."
+
+
+    else:
+        reply = ("Comandos disponibles:\n"
+                 "• oficial  – tasa BCV\n"
+                 "• paralelo – mejor precio Binance\n"
+                 "• bancos   – tasas bancarias")
+
+
+    await send_whatsapp(waid, reply)
+    return {"status": "sent"}
+
+
+# ───────────── Envío WhatsApp ─────────────
+async def send_whatsapp(to, body):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"preview_url": False, "body": text},
+        "text": {"preview_url": False, "body": body}
     }
-    headers = {"Authorization": f"Bearer {TOKEN}"}
+    headers = {"Authorization": f"Bearer {WHATS_TOKEN}"}
     r = await fetch("POST", url, json=payload, headers=headers)
-    return r.json()
+    if r.status_code >= 300:
+        print("WA send error", r.status_code, r.text[:150])
 
-# ──────────────────────────────────────────────────────────────
-# 1. TC oficial BCV (widget del home)
-# ──────────────────────────────────────────────────────────────
-async def get_oficial() -> float:
-    url = "https://www.bcv.org.ve/"
-    html = (await fetch("GET", url)).text
-    soup = BeautifulSoup(html, "lxml")
 
-    # Busca la fila ‘USD’ en la caja de referencia
-    fila = soup.find("div", string=re.compile(r"^\s*USD\s*$"))
-    if not fila:
-        raise ValueError("USD no encontrado")
+# ───────────── FETCHERS ─────────────
+async def get_oficial():
+    """
+    Tasa BCV Bs/USD.
+    Fuentes en cascada:
+      1. Banco Exterior – columna VENTA
+      2. Monitor Dólar   – valor BCV
+      3. FinanzasDigital – último post Tasa BCV
+    """
+    if (v := cache_get("oficial")):
+        return v
 
-    valor_txt = fila.find_next("div").get_text(strip=True)
-    valor = float(valor_txt.replace(",", "."))
-    return valor
 
-# ──────────────────────────────────────────────────────────────
-# 2. Paralelo Binance (mejor VENDEDOR no promocionado)
-# ──────────────────────────────────────────────────────────────
-async def get_paralelo() -> float:
-    url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-    payload = {
-        "asset": "USDT",
-        "fiat": "VES",
-        "tradeType": "SELL",        # vendedores → tú compras VES
-        "page": 1,
-        "rows": 10,
-        "payTypes": [],
-        "publisherType": None
-    }
-    data = (await fetch("POST", url, json=payload)).json()["data"]
+    sources = [
+        ("https://www.bancoexterior.com/tasas-bcv/",
+         r"venta[^0-9]{0,30}(\d{1,3}(?:[.,]\d{2,})+)"),
+        ("https://monitordolarvenezuela.com/",
+         r"(bcv|d[óo]lar)[^0-9]{0,30}(\d{1,3}(?:[.,]\d{2,})+)"),
+        ("https://finanzasdigital.com/category/tasa-bcv/",
+         r"(bcv|d[óo]lar)[^0-9]{0,30}(\d{1,3}(?:[.,]\d{2,})+)")
+    ]
 
-    # filtra ads patrocinados (proMerchantAds = true)
-    precios = [float(ad["adv"]["price"])
-               for ad in data
-               if not ad["adv"].get("proMerchantAds")]
 
-    if not precios:
-        raise ValueError("sin precios libres")
-    return min(precios)             # mejor (más barato)
-
-# ──────────────────────────────────────────────────────────────
-# 3. Mesas Bancarias (compra / venta)
-# ──────────────────────────────────────────────────────────────
-async def get_bancos() -> Tuple[str, List[Tuple[str,float,float]]]:
-    url = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
-    html = (await fetch("GET", url)).text
-    soup = BeautifulSoup(html, "lxml")
-
-    rows = soup.select("table tbody tr")
-    if not rows:
-        return None, []
-
-    datos, last_date = [], None
-    for tr in rows:
-        cols = [td.get_text(strip=True) for td in tr.select("td")]
-        if len(cols) < 4:
-            continue
-        fecha, banco, compra, venta = cols[:4]
-
-        if last_date is None:
-            last_date = fecha
-        if fecha != last_date:
-            break
-
-        datos.append((
-            banco,
-            float(compra.replace(",", ".")),
-            float(venta.replace(",", "."))
-        ))
-    return last_date, datos
-
-# ──────────────────────────────────────────────────────────────
-# 4. Webhook
-# ──────────────────────────────────────────────────────────────
-@app.get("/webhook")
-async def verify(mode: str = "", challenge: str = "", verify_token: str = ""):
-    if mode == "subscribe" and verify_token == "miwhatsappcambio":
-        return int(challenge)
-    raise HTTPException(status_code=403)
-
-@app.post("/webhook")
-async def incoming(request: Request):
-    body = await request.json()
-    try:
-        entry = body["entry"][0]["changes"][0]["value"]["messages"][0]
-        text = entry["text"]["body"].lower().strip()
-        from_wa = entry["from"]
-    except (KeyError, IndexError):
-        return {"status": "ignored"}
-
-    # --- comandos ---
-    if text in {"oficial", "bcv"}:
+    for url, pat in sources:
         try:
-            tasa = await get_oficial()
-            msg = f"📊 Oficial BCV: {tasa:,.2f} Bs/USD"
+            html = (await fetch("GET", url)).text.lower()
+            m = re.search(pat, html, re.S)
+            if not m:
+                continue
+            num = m.group(1 if "bancoexterior" in url else 2)
+            val = float(num.replace(".", "").replace(",", "."))
+            cache_set("oficial", val)
+            return val
         except Exception as e:
-            msg = "BCV fuera de línea"
-        await send_text(msg, from_wa)
+            print("Fuente BCV error:", url, e)
 
-    elif text.startswith(("paralelo", "binance", "p2p")):
-        try:
-            tasa = await get_paralelo()
-            msg = f"🤝 Paralelo Binance: {tasa:,.2f} Bs/USDT"
-        except Exception:
-            msg = "Binance fuera de línea"
-        await send_text(msg, from_wa)
 
-    elif text in {"bancos", "mesas"}:
-        fecha, filas = await get_bancos()
-        if not filas:
-            await send_text("BCV aún no publica las mesas de hoy.", from_wa)
-        else:
-            header = f"🏦 Mesas ({fecha})\nCOMPRA | VENTA\n"
-            body = "\n".join(f"{b:18} {c:6.2f} | {v:6.2f}"
-                             for b,c,v in filas)
-            await send_text(header+body, from_wa)
+    print("Todas las fuentes BCV fallaron")
+    return None
 
+
+async def get_paralelo():
+    """
+    Devuelve el primer precio que muestra
+    https://p2p.binance.com/es/trade/all-payments/USDT?fiat=VES
+    (tú compras USDT - anuncio SELL).  Si la página cambia o
+    Cloudflare bloquea, usa la API como respaldo.
+    Cache 3 min.
+    """
+    if (v := cache_get("paralelo")):
+        return v
+
+
+   # 1) ─── HTML (lo que ve el usuario) ─────────────────────────────
+try:
+    html = (await fetch("GET",
+             "https://p2p.binance.com/es/trade/all-payments/USDT?fiat=VES",
+             headers={"User-Agent": "Mozilla/5.0"})).text
+
+
+    # captura **todos** los precios que aparecen en orden
+    prices = re.findall(r"Bs\s*([\d.]+,\d{2,})", html)
+    if len(prices) >= 2:
+        val = float(prices[1].replace(".", "").replace(",", "."))
+    elif prices:
+        val = float(prices[0].replace(".", "").replace(",", "."))
     else:
-        await send_text("Comandos: oficial | paralelo | bancos", from_wa)
+        val = None
 
-    return {"status": "ok"}
 
-# ──────────────────────────────────────────────────────────────
-# ejecuta con:  uvicorn main:app --host 0.0.0.0 --port 10000
-# ──────────────────────────────────────────────────────────────
+    if val:
+        cache_set("paralelo", val, ttl=timedelta(minutes=3))
+        return val
+except Exception as e:
+    print("HTML Binance:", e)
+
+
+    # 2) ───── respaldo vía API (sin patrocinados) ─────
+    try:
+        url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+        payload = {
+            "asset": "USDT",
+            "fiat":  "VES",
+            "tradeType": "SELL",
+            "page": 1,
+            "rows": 20,
+            "publisherType": None
+        }
+        ads = (await fetch("POST", url, json=payload)).json()["data"]
+
+
+        precios = [
+            float(ad["adv"]["price"])
+            for ad in ads
+            if not ad["adv"].get("proMerchantAds")
+            and float(ad["adv"]["surplusAmount"]) > 0
+        ]
+        if precios:
+            best = min(precios)
+            cache_set("paralelo", best, ttl=timedelta(minutes=3))
+            return best
+    except Exception as e:
+        print("API Binance:", e)
+
+
+    return None          # si todo falló
+
+
+
+
+async def get_bancos():
+ from datetime import date          # ya está importado arriba
+
+
+async def get_bancos():
+    """
+    Devuelve (fecha_mas_reciente:str, compras:dict, ventas:dict)
+    Siempre toma la fila MÁS RECIENTE de cada banco.
+    Cache 15 min.
+    """
+    if (v := cache_get("bancos")):
+        return v
+
+
+    url = "https://www.bcv.org.ve/tasas-informativas-sistema-bancario"
+    try:
+        html = (await fetch("GET", url)).text
+        soup = BeautifulSoup(html, "html.parser")
+
+
+        # ----- leer todas las filas -----
+        rows = []
+        for tr in soup.select("table tbody tr"):
+            tds = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
+            if len(tds) >= 4:                      # [fecha,banco,compra,venta]
+                try:
+                    f = datetime.strptime(tds[0], "%d-%m-%Y").date()
+                    rows.append((f, tds[1], float(tds[2]), float(tds[3])))
+                except ValueError:
+                    continue                       # ignora encabezados fantasma
+
+
+        if not rows:
+            return None
+
+
+        # ----- seleccionar la fila +reciente por banco -----
+        ultimo_por_banco = {}
+        for f, banco, comp, vent in rows:
+            if banco not in ultimo_por_banco or f > ultimo_por_banco[banco][0]:
+                ultimo_por_banco[banco] = (f, comp, vent)
+
+
+        # separa en dicts compra / venta y detecta la fecha global más nueva
+        fecha_max = max(v[0] for v in ultimo_por_banco.values())
+        compra = {b: v[1] for b, v in ultimo_por_banco.items()}
+        venta  = {b: v[2] for b, v in ultimo_por_banco.items()}
+
+
+        out = (fecha_max.strftime("%d-%m-%Y"), compra, venta)
+        cache_set("bancos", out, ttl=timedelta(minutes=15))
+        return out
+
+
+    except Exception as e:
+        print("Mesas:", e)
+        return None
+
+
