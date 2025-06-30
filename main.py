@@ -190,7 +190,11 @@ async def get_paralelo():
     return None
 
 async def get_bancos():
-    """Devuelve (fecha, dict_compra, dict_venta) usando la tabla de Mesas BCV."""
+    """
+    Devuelve (fecha, dict_compra, dict_venta) –– toma la fila MÁS RECIENTE
+    de cada banco en https://www.bcv.org.ve/tasas-informativas-sistema-bancario
+    Cache 15 min.
+    """
     if (v := cache_get("bancos")):
         return v
 
@@ -199,15 +203,34 @@ async def get_bancos():
         html = (await fetch("GET", url)).text
         soup = BeautifulSoup(html, "html.parser")
 
-        rows = []
+        filas = []
         for tr in soup.select("table tbody tr"):
             tds = [td.get_text(strip=True).replace(",", ".") for td in tr.find_all("td")]
             if len(tds) >= 4:
                 try:
                     f = datetime.strptime(tds[0], "%d-%m-%Y").date()
-                    rows.append((f, tds[1], float(tds[2]), float(tds[3])))
+                    filas.append((f, tds[1], float(tds[2]), float(tds[3])))
                 except ValueError:
-                    continue
+                    continue          # ignora cabeceras repetidas
 
-        if not rows:
-            return N
+        if not filas:
+            return None
+
+        # pick última fila por banco
+        ult = {}
+        for f, banco, comp, vent in filas:
+            if banco not in ult or f > ult[banco][0]:
+                ult[banco] = (f, comp, vent)
+
+        fecha_max = max(v[0] for v in ult.values())
+        compra = {b: v[1] for b, v in ult.items()}
+        venta  = {b: v[2] for b, v in ult.items()}
+
+        out = (fecha_max.strftime("%d-%m-%Y"), compra, venta)
+        cache_set("bancos", out, ttl=timedelta(minutes=15))
+        return out
+
+    except Exception as e:
+        print("Mesas:", e)
+        return None
+
